@@ -9,20 +9,21 @@
 
 Player features are rebuilt from training_data_set/dataset_more_metrics.csv the same way data_extraction.ipynb computes
 them, using every match up to the latest one in the data (run the daily pull + data_extraction first to be up to date).
+Elo and Glicko-2 ratings come from training_data_set/player_ratings.csv, written by data_extraction with ratings.py.
 """
 import argparse, os, re, unicodedata
 from collections import Counter, defaultdict
 import joblib, numpy as np, pandas as pd, xgboost as xgb
 from sklearn.preprocessing import StandardScaler
+import ratings
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 SRC = os.path.join(ROOT, 'src')
-SURFACES = ['Hard', 'Clay', 'Grass', 'Carpet']
-LEVEL_START = {'G': 1600, 'M': 1500, 'A': 1400}  # initial Elo by level of the first match, as in data_extraction
+SURFACES, LEVEL_START = ratings.SURFACES, ratings.LEVEL_START
 CATEGORICAL = ['tourney_level', 'surface', 'round']
-# The model is slightly overconfident (says 72% where players win ~69-70%): p -> sigmoid(slope * logit(p)), slope fitted on the
-# tested model's predictions for 2012-2018 (matches it never saw); on 2019-2026 this improved log loss 0.6107 -> 0.6101.
-CALIBRATION_SLOPE = 0.965
+# p -> sigmoid(slope * logit(p)). The model before the lower-level ratings was slightly overconfident (slope 0.965); the
+# current one isn't: a slope fitted on its 2012-2018 test predictions did no better on 2019-2026 than leaving it at 1.
+CALIBRATION_SLOPE = 1.0
 GAVE_UP = re.compile(r'RET|W/O|Walkover')  # retired injured or gave a walkover
 
 
@@ -38,23 +39,21 @@ def _norm(s):
 class Predictor:
     def __init__(self, before=None):
         """Player states from all matches in the data, or only those before `before` (yyyymmdd)."""
-        elo_cols = [f'{w}_{s.lower()}_elo_post' for w in ('winner', 'loser') for s in SURFACES + ['Overall']]
         m = pd.read_csv(f'{ROOT}/training_data_set/dataset_more_metrics.csv',
                         usecols=['tourney_date', 'surface', 'tourney_level', 'Player_1', 'Player_2', 'score',
-                                 'Player_1_performance', 'Player_2_performance'] + elo_cols)
+                                 'Player_1_performance', 'Player_2_performance'])
         if before:
             m = m[m['tourney_date'] < before]
+            lower = ratings.load_lower(f'{ROOT}/data_set_2')
+            state = ratings.rate(m, lower[lower['tourney_date'] < before])[1]  # same code data_extraction uses
+        else:
+            state = pd.read_csv(f'{ROOT}/training_data_set/player_ratings.csv', index_col='player')
+        self.ratings = state.to_dict('index')  # Elo (overall + per surface) and Glicko-2 of every player, incl. lower levels
         self.latest = int(m['tourney_date'].max())
-        self.start, self.elo, self.surface_elo = {}, {}, {s: {} for s in SURFACES}
         self.matches, self.last, self.perf = defaultdict(int), {}, defaultdict(list)
         self.surface_record, self.h2h, self.gave_up = defaultdict(lambda: [0, 0]), defaultdict(int), {}
         for r in m.itertuples(index=False):  # Player_1 is the winner
             for side, player, won in ((1, r.Player_1, 1), (2, r.Player_2, 0)):
-                who = 'winner' if won else 'loser'
-                self.start.setdefault(player, LEVEL_START.get(str(r.tourney_level).upper(), 1300))
-                self.elo[player] = getattr(r, f'{who}_overall_elo_post')
-                if r.surface in SURFACES:
-                    self.surface_elo[r.surface][player] = getattr(r, f'{who}_{r.surface.lower()}_elo_post')
                 self.matches[player] += 1
                 self.last[player] = r.tourney_date
                 record = self.surface_record[(player, str(r.surface).strip())]
@@ -74,10 +73,11 @@ class Predictor:
         # tour-level matches: they get the debut values (starting Elo, no form, 0 career matches) and the ranking's birth date
         self.alias = {}  # name in the current ranking -> same player's name in the match data (itself if he has no matches yet)
         if os.path.exists(f'{ROOT}/data_set_2/atp_current_ranking.csv'):
-            by_norm = {_norm(p): p for p in self.elo}
-            by_dob = {(d, _norm(p).split()[-1], _norm(p)[0]): p for p, d in self.dob.items() if p in self.elo and not pd.isna(d) and _norm(p)}
-            # players Sackmann doesn't have keep tennis-data's short name: 'Simakin I.' -> ('simakin', 'i')
-            short = {p: (_norm(m[1]), _norm(m[2]).replace(' ', '')) for p in self.elo if (m := re.match(r'^(.+)\s+([\w.-]+)\.$', p))}
+            known = set(self.ratings) | set(self.last)  # players with matches at any level
+            by_norm = {_norm(p): p for p in known}
+            by_dob = {(d, _norm(p).split()[-1], _norm(p)[0]): p for p, d in self.dob.items() if p in known and not pd.isna(d) and _norm(p)}
+            # tour players data_extraction couldn't give a full name keep tennis-data's short one: 'Simakin I.' -> ('simakin', 'i')
+            short = {p: (_norm(m[1]), _norm(m[2]).replace(' ', '')) for p in self.last if (m := re.match(r'^(.+)\s+([\w.-]+)\.$', p))}
             ranking = pd.read_csv(f'{ROOT}/data_set_2/atp_current_ranking.csv')
             keys = ranking['name'].map(_norm)
             fits = [[p for p, (sur, ini) in short.items() if k.endswith(' ' + sur) and k[:-len(sur)].replace(' ', '').startswith(ini)] for k in keys]
@@ -100,13 +100,13 @@ class Predictor:
     def resolve(self, name):
         """Exact name, else a unique player whose name contains every word given ('Sinner', 'J Sinner'): first among the
         tour players active since 2025, then among every currently ranked player."""
-        if name in self.elo:
+        if name in self.last or name in self.ratings:
             return name
         if name in self.alias:
             return self.alias[name]
         words = _norm(name).split()
         fits = lambda p: all(w in _norm(p).split() or any(t.startswith(w) for t in _norm(p).split()) for w in words)
-        for pool in ([p for p in self.elo if self.last[p] >= 20250101], self.alias):
+        for pool in ([p for p, last in self.last.items() if last >= 20250101], self.alias):
             hits = sorted({self.alias.get(p, p) for p in pool if fits(p)})
             if len(hits) == 1:
                 return hits[0]
@@ -116,14 +116,20 @@ class Predictor:
 
     def profile(self, p, surface, day, tourney_level='A'):
         """A player's values before a match on `day` (yyyymmdd), as the model sees them."""
-        day = pd.Timestamp(str(day))
         start = LEVEL_START.get(str(tourney_level).upper(), 1300)
+        r = self.ratings.get(p, {})
+        if pd.notna(r.get('glicko', np.nan)):  # Glicko-2 deviation grows with the weeks since the player's last match
+            glicko, rd = r['glicko'], ratings.inflate(r['glicko_phi'], r['glicko_sigma'], ratings.day_number(day) - r['glicko_day']) * ratings.Q
+        else:  # never rated by Glicko-2 (new, or Futures only): starting values, as in data_extraction
+            glicko, rd = start, ratings.PHI0 * ratings.Q
+        day = pd.Timestamp(str(day))
         wins, n = self.surface_record.get((p, surface), (0, 0))
         perf = self.perf.get(p, [])[-5:]
         born = self.dob.get(p)
         age = (day - born).days / 365.25 if born is not None and not pd.isna(born) else np.nan
-        return {'elo': self.elo.get(p, start),
-                'surface_elo': self.surface_elo[surface].get(p, self.start.get(p, start)) if surface in SURFACES else 0.0,
+        return {'elo': r.get('elo_overall', start),
+                'surface_elo': r.get(f'elo_{surface.lower()}', start) if surface in SURFACES else 0.0,
+                'glicko': glicko, 'rd': rd,
                 'surface_wins': wins, 'surface_matches': n,
                 'surface_win_rate': wins / n if n else np.nan,
                 'days_since_last': (day - pd.Timestamp(str(self.last[p]))).days if p in self.last else np.nan,
@@ -136,7 +142,7 @@ class Predictor:
         pa, pb = self.profile(a, surface, day, tourney_level), self.profile(b, surface, day, tourney_level)
         wa, wb = self.h2h.get((a, b), 0), self.h2h.get((b, a), 0)
         row = {'elo_diff': pa['elo'] - pb['elo'], 'surface_elo_diff': pa['surface_elo'] - pb['surface_elo'],
-               'h2h_ratio': (wa + 1) / (wa + wb + 2)}
+               'h2h_ratio': (wa + 1) / (wa + wb + 2), 'glicko_diff': pa['glicko'] - pb['glicko'], 'player1_rd': pa['rd'], 'player2_rd': pb['rd']}
         for k in ('surface_win_rate', 'days_since_last', 'recent_perf', 'age', 'career_matches'):
             row[f'player1_{k}'], row[f'player2_{k}'] = pa[k], pb[k]
         for c, v in (('tourney_level', tourney_level), ('surface', surface), ('round', round_)):
