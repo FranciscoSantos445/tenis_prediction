@@ -6,12 +6,13 @@
                                                                     #          (+ optional odds_a, odds_b)
     python predict_matches.py --recent 20260921                      # honest predictions of the matches played since then
     python predict_matches.py --check                                # rebuilt features == data_extraction's features
+    python predict_matches.py --backtest 1000                        # the app's betting rule on 2012-2026 matches, from 1000
 
 Player features are rebuilt from training_data_set/dataset_more_metrics.csv the same way data_extraction.ipynb computes
 them, using every match up to the latest one in the data (run the daily pull + data_extraction first to be up to date).
 Elo and Glicko-2 ratings come from training_data_set/player_ratings.csv, written by data_extraction with ratings.py.
 """
-import argparse, os, re, unicodedata
+import argparse, math, os, re, unicodedata
 from collections import Counter, defaultdict
 import joblib, numpy as np, pandas as pd, xgboost as xgb
 from sklearn.preprocessing import StandardScaler
@@ -25,6 +26,12 @@ CATEGORICAL = ['tourney_level', 'surface', 'round']
 # current one isn't: a slope fitted on its 2012-2018 test predictions did no better on 2019-2026 than leaving it at 1.
 CALIBRATION_SLOPE = 1.0
 GAVE_UP = re.compile(r'RET|W/O|Walkover')  # retired injured or gave a walkover
+# Risk manager (predict_app.py and --backtest). The model alone is less accurate than the bookmaker (2012-2026, same matches:
+# log loss 0.593 vs 0.582), so a bet is judged on a mix: MODEL_WEIGHT of the model's chance, the rest the bookmaker's (margin
+# removed). The weight was fitted on 2007-2012 matches; on 2012-2026 the mix was no better than the bookmaker alone.
+MODEL_WEIGHT = 0.11
+MIN_ODDS, MAX_ODDS = 1.20, 3.00             # no bets below 1.20, nor on long shots above 3.00 (high variance)
+KELLY, MAX_BET, MAX_DAY = 0.25, 0.01, 0.03  # quarter-Kelly, at most 1% of the bankroll on one bet and 3% on one day
 
 
 def calibrate(p):
@@ -183,11 +190,35 @@ class Predictor:
         return level, headline, warnings
 
 
+def risk(p, odds_a, odds_b, bankroll, open_today=0.0):
+    """Bet or pass, given the model's chance p for player a, both decimal odds, the bankroll and the stakes already bet that
+    day: dict(side=0 (a) | 1 (b) | None, stake, floor (lowest odds still worth taking), reason (why not), sides=[for a and b:
+    model, fair (bookmaker's chance without its margin), chance (the mix), odds, ev (expected return per 1 staked)])."""
+    fair_a = (1 / odds_a) / (1 / odds_a + 1 / odds_b)
+    sides = [dict(model=m, fair=f, chance=MODEL_WEIGHT * m + (1 - MODEL_WEIGHT) * f, odds=o) for m, f, o in ((p, fair_a, odds_a), (1 - p, 1 - fair_a, odds_b))]
+    for x in sides:
+        x['ev'] = x['chance'] * x['odds'] - 1
+    side = 0 if sides[0]['ev'] >= sides[1]['ev'] else 1
+    x = sides[side]
+    stake = round(min(KELLY * x['ev'] / (x['odds'] - 1) * bankroll, MAX_BET * bankroll, MAX_DAY * bankroll - open_today), 2)
+    if x['ev'] <= 0:
+        reason = f"no value on either player (best expected return {x['ev']:+.1%})"
+    elif not MIN_ODDS <= x['odds'] <= MAX_ODDS:
+        reason = f"the value is at odds {x['odds']:.2f}, outside {MIN_ODDS:.2f}-{MAX_ODDS:.2f}"
+    elif MAX_DAY * bankroll - open_today < .01:
+        reason = f'daily limit reached ({MAX_DAY:.0%} of the bankroll)'
+    elif stake < .01:
+        reason = 'edge too small for a stake'
+    else:
+        return dict(side=side, stake=stake, floor=max(MIN_ODDS, math.ceil(100 / x['chance']) / 100), reason='', sides=sides)
+    return dict(side=None, stake=0.0, floor=None, reason=reason, sides=sides)
+
+
 def recent(cutoff):
     """Train on matches before `cutoff` with the tuned settings, predict every match since (results unseen by the model)."""
     b = pd.read_csv(f'{ROOT}/training_data_set/tennis_matches_balanced.csv')
     info = pd.read_csv(f'{ROOT}/training_data_set/dataset_more_metrics.csv',
-                       usecols=['tourney_name', 'tourney_date', 'round', 'Player_1', 'Player_2', 'score', 'Odd_1', 'Odd_2'])
+                       usecols=['tourney_name', 'tourney_date', 'round', 'Player_1', 'Player_2', 'score', 'Odd_1', 'Odd_2', 'PS_1', 'PS_2'])
     columns = list(joblib.load(f'{SRC}/final_scaler.joblib').feature_names_in_)
     numeric = [c for c in columns if c in b.columns]
     X = pd.get_dummies(b[numeric + CATEGORICAL], columns=CATEGORICAL).reindex(columns=columns, fill_value=False)
@@ -203,7 +234,32 @@ def recent(cutoff):
     out = info.assign(p_winner=p_winner)[info['tourney_date'] >= cutoff]
     odds = out[['Odd_1', 'Odd_2']].apply(pd.to_numeric, errors='coerce').where(lambda o: o > 1)
     out = out.assign(bookmaker_p_winner=(1 / odds['Odd_1']) / (1 / odds['Odd_1'] + 1 / odds['Odd_2']))
-    return out.rename(columns={'Player_1': 'winner', 'Player_2': 'loser'}).drop(columns=['Odd_1', 'Odd_2'])
+    return out.rename(columns={'Player_1': 'winner', 'Player_2': 'loser'})  # Odd_* (Bet365), PS_* (Pinnacle): winner's, loser's
+
+
+def backtest(bankroll, since=20120712):
+    """The risk() rule on every match since `since` (default: those the tested model never saw) with a model trained only
+    on the matches before it, at Bet365's and Pinnacle's prices. Each day's stakes come from the bankroll at the start of
+    the day, highest expected return first."""
+    out = recent(since)
+    for book, name in (('Odd', 'Bet365'), ('PS', 'Pinnacle')):
+        odds = out[[f'{book}_1', f'{book}_2']].apply(pd.to_numeric, errors='coerce')
+        x = out.assign(o1=odds.iloc[:, 0], o2=odds.iloc[:, 1]).query('o1 > 1 and o2 > 1')
+        money, peak, drop, bets, won, staked = bankroll, bankroll, 0.0, 0, 0, 0.0
+        for _, day in x.groupby('tourney_date'):
+            first = [(risk(r.p_winner, r.o1, r.o2, money), r) for r in day.itertuples()]
+            open_today, profit = 0.0, 0.0
+            for _, r in sorted(((d, r) for d, r in first if d['side'] is not None), key=lambda t: -t[0]['sides'][t[0]['side']]['ev']):
+                d = risk(r.p_winner, r.o1, r.o2, money, open_today)  # player a is the winner
+                if d['side'] is None:
+                    break  # daily limit
+                open_today += d['stake']
+                profit += d['stake'] * (r.o1 - 1) if d['side'] == 0 else -d['stake']
+                bets, won, staked = bets + 1, won + (d['side'] == 0), staked + d['stake']
+            money += profit
+            peak, drop = max(peak, money), max(drop, 1 - money / peak)
+        print(f"{name}: {bets} bets on {len(x)} matches ({won / max(bets, 1):.0%} won), staked {staked:,.2f}, profit {money - bankroll:+,.2f} "
+              f"({(money - bankroll) / max(staked, 1e-9):+.1%} of the stakes), bankroll {bankroll:,.2f} -> {money:,.2f}, worst drop {drop:.0%}")
 
 
 def check():
@@ -227,10 +283,13 @@ if __name__ == '__main__':
     ap.add_argument('players', nargs='*')
     ap.add_argument('--surface', default='Hard'); ap.add_argument('--level', default='A'); ap.add_argument('--round', default='R32')
     ap.add_argument('--date', help='yyyymmdd, default today'); ap.add_argument('--file'); ap.add_argument('--recent', type=int); ap.add_argument('--check', action='store_true')
+    ap.add_argument('--backtest', type=float, metavar='BANKROLL', help='bet the risk rule on 2012-2026 matches starting with this bankroll')
     ap.add_argument('--odds', nargs=2, type=float, metavar=('ODDS_A', 'ODDS_B'), help='decimal odds offered for player a and player b')
     args = ap.parse_args()
     if args.check:
         check()
+    elif args.backtest:
+        backtest(args.backtest)
     elif args.recent:
         out = recent(args.recent)
         path = f'{ROOT}/predictions/recent_since_{args.recent}.csv'
@@ -259,4 +318,4 @@ if __name__ == '__main__':
             print(f"    [{level}] {headline}" + ''.join(f"\n    note: {w}" for w in warnings))
         if 'odds_a' in matches:
             print("Note: on 2012-2026 matches the bookmaker's chance was the more accurate one, and betting whenever the model saw"
-                  " value (expected return > 0) lost 8-15% of the stakes. Treat the model's number as a second opinion.")
+                  " value (expected return > 0) lost 10-17% of the stakes. Treat the model's number as a second opinion.")

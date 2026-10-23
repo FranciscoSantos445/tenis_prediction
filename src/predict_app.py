@@ -13,7 +13,8 @@ import tkinter as tk
 from tkinter import ttk
 import numpy as np
 import pandas as pd
-from predict_matches import Predictor, SURFACES
+from predict_matches import Predictor, SURFACES, ROOT, risk, MAX_DAY
+import tennis_explorer
 import update
 
 UPDATE_COMMAND = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'update.py')]
@@ -28,7 +29,9 @@ FONT = 'Noto Sans'
 LEVELS = {'ATP 250 / 500': 'A', 'Masters 1000': 'M', 'Grand Slam': 'G', 'Tour Finals': 'F', 'Davis Cup': 'D'}
 ROUNDS = {'Round of 128': 'R128', 'Round of 64': 'R64', 'Round of 32': 'R32', 'Round of 16': 'R16',
           'Quarterfinal': 'QF', 'Semifinal': 'SF', 'Final': 'F', 'Round robin': 'RR'}
-NOTE = ("The bookmaker's odds were more accurate than the model on 2012-2026 matches; betting on the model's value lost 8-15%. "
+LEVEL_NAMES = {code: label for label, code in LEVELS.items()}
+ROUND_NAMES = {code: label for label, code in ROUNDS.items()}
+NOTE = ("The bookmaker's odds were more accurate than the model on 2012-2026 matches; betting on the model's value lost 10-17%. "
         "The safest rule, both at 80%+, won 90% of bets but lost 2.8% at Bet365 (about break-even at the best price on offer).")
 
 
@@ -113,6 +116,8 @@ class App(tk.Tk):
         self.minsize(1280, 600)
         self.predictor, self.names, self.p, self.current, self.slip = None, [], None, None, []
         self.updater = None  # today's update.py run, if one was started
+        self.picked = None  # [upcoming match key, its players as resolved by the predictor] after clicking an upcoming match
+        self.verdicts = {}  # upcoming match key (date, player a, player b) -> stake suggested (0: pass)
         self._style()
         self._header()
         body = tk.Frame(self, bg=BG)
@@ -123,8 +128,10 @@ class App(tk.Tk):
         self._form(left)
         self._result(left)
         self._slip_card(right)
+        self._upcoming_card(right)
         threading.Thread(target=self._load, daemon=True).start()
         self.after(150, self._wait_until_loaded)
+        self._refresh_upcoming()
 
     # ---------- look ----------
     def _style(self):
@@ -137,6 +144,9 @@ class App(tk.Tk):
         s.map('TEntry', bordercolor=[('focus', ACCENT)])
         s.configure('Accent.TButton', background=ACCENT, foreground='white', font=(FONT, 11, 'bold'), padding=(22, 10), borderwidth=0)
         s.map('Accent.TButton', background=[('disabled', '#a7d8c4'), ('active', ACCENT_DARK)])
+        s.configure('Treeview', font=(FONT, 10), rowheight=24, background=CARD, fieldbackground=CARD, bordercolor=LINE)
+        s.configure('Treeview.Heading', font=(FONT, 9, 'bold'), foreground=MUTED, background=CARD, borderwidth=0)
+        s.map('Treeview', background=[('selected', ACCENT)], foreground=[('selected', 'white')])
         s.configure('Slip.TButton', background='#eef6f2', foreground=ACCENT_DARK, font=(FONT, 10, 'bold'), padding=(12, 6), borderwidth=0)
         s.map('Slip.TButton', background=[('disabled', BG), ('active', '#dcefe6')], foreground=[('disabled', '#b3b9c2')])
         self.option_add('*TCombobox*Listbox.font', (FONT, 11))
@@ -194,6 +204,7 @@ class App(tk.Tk):
         odds.grid(row=4, column=0, columnspan=3, sticky='ew', pady=(16, 0))
         self.odds_a = self._entry(odds, 'Odds on player A (optional)', 12)
         self.odds_b = self._entry(odds, 'Odds on player B (optional)', 12)
+        self.bankroll = self._entry(odds, 'Bankroll', 10, '1000')
         self.button = ttk.Button(odds, text='Predict', style='Accent.TButton', command=self._predict, state='disabled')
         self.button.pack(side='right', anchor='s')
         self.bind('<Return>', lambda e: self._predict())
@@ -291,25 +302,47 @@ class App(tk.Tk):
             shade = '#f7f8fa' if i % 2 == 0 else CARD
             for col, (text, anchor, color, bold) in enumerate(((va, 'w', INK, True), (name, 'center', MUTED, False), (vb, 'e', INK, True))):
                 tk.Label(self.stats, text=text, bg=shade, fg=color, anchor=anchor, font=(FONT, 10, 'bold' if bold else 'normal'),
-                         padx=10, pady=2).grid(row=i, column=col, sticky='ew')
+                         padx=10, pady=1).grid(row=i, column=col, sticky='ew')
 
-    def _show_bets(self, a, b, p, odds_a, odds_b):
+    def _show_bets(self, a, b, p, odds_a, odds_b, bankroll, key):
+        """Each bet's chance and expected return and, with both odds, the risk manager's bet or pass (predict_matches.risk:
+        model mixed with the bookmaker, stakes from the bankroll). Only matches from Upcoming matches can be a bet; `key` is
+        the upcoming match's, None otherwise. Returns the stake suggested (0 when passing)."""
         for child in self.bets.winfo_children():
             child.destroy()
-        fair_a = (1 / odds_a) / (1 / odds_a + 1 / odds_b) if odds_a and odds_b else None
-        row = 0
-        for player, chance, odds, fair, color in ((a, p, odds_a, fair_a, COLOR_A), (b, 1 - p, odds_b, None if fair_a is None else 1 - fair_a, COLOR_B)):
+        self.bets.columnconfigure(0, weight=1)
+        open_today = sum(stake for k, stake in self.verdicts.items() if key and k[0] == key[0] and k != key)
+        d = risk(p, odds_a, odds_b, bankroll, open_today) if odds_a and odds_b else None
+        for i, (player, odds, color) in enumerate(((a, odds_a, COLOR_A), (b, odds_b, COLOR_B))):
             if not odds:
                 continue
+            if d:
+                s = d['sides'][i]
+                chance, sure = s['chance'], f"   wins {s['chance']:.1%}  (model {s['model']:.1%}, bookmaker {s['fair']:.1%})"
+            else:
+                chance = p if i == 0 else 1 - p
+                sure = f'   wins {chance:.1%} of the time per the model'
             ev = 10 * (chance * odds - 1)
-            line = tk.Frame(self.bets, bg='#eef6f2' if chance * odds > 1 else '#fbf1ee', padx=12, pady=7)
-            line.grid(row=row, column=0, sticky='ew', pady=(0, 6))
-            self.bets.columnconfigure(0, weight=1)
+            line = tk.Frame(self.bets, bg='#eef6f2' if ev > 0 else '#fbf1ee', padx=12, pady=7)
+            line.grid(row=i + 1, column=0, sticky='ew', pady=(0, 6))
             self._label(line, f'Bet on {player} @ {odds:.2f}', 10, True, color).pack(side='left')
-            sure = f'   wins {chance:.1%} of the time' + (f'  (bookmaker: {fair:.1%})' if fair is not None else '')
             self._label(line, sure, 10).pack(side='left')
             self._label(line, f'expected return per 10 staked: {ev:+.2f}', 10, True, GOOD if ev > 0 else BAD).pack(side='right')
-            row += 1
+        if d is None:
+            return 0.0
+        if key is None:
+            d = dict(d, side=None, stake=0.0, reason='only matches picked from Upcoming matches are bet on')
+        box = tk.Frame(self.bets, bg='#e3f4ea' if d['side'] is not None else '#eef1f5', padx=12, pady=8)
+        box.grid(row=0, column=0, sticky='ew', pady=(0, 6))
+        if d['side'] is not None:
+            player, odds = (a, odds_a) if d['side'] == 0 else (b, odds_b)
+            verdict = f"BET {player} @ {odds:.2f}  -  stake {d['stake']:.2f} ({d['stake'] / bankroll:.1%})  -  min odds {d['floor']:.2f}"
+        else:
+            verdict = f"PASS: {d['reason']}"
+        self._label(box, verdict, 10, True, GOOD if d['side'] is not None else MUTED).pack(side='left')
+        if key:  # bets suggested for that day, against the daily limit
+            self._label(box, f"{key[0]:%d %b}: {open_today + d['stake']:.2f} / {MAX_DAY * bankroll:.2f} limit", 9, color=MUTED).pack(side='right')
+        return d['stake']
 
     # ---------- actions ----------
     def _load(self):
@@ -382,6 +415,12 @@ class App(tk.Tk):
             odds_a, odds_b = self._odds(self.odds_a), self._odds(self.odds_b)
         except ValueError:
             return self.message.configure(text='Odds are decimal numbers above 1, for example 1.85.', fg=BAD)
+        try:
+            bankroll = float(self.bankroll.get().strip().replace(',', '.'))
+        except ValueError:
+            bankroll = 0
+        if bankroll <= 0:
+            return self.message.configure(text='The bankroll is an amount above 0, for example 1000.', fg=BAD)
 
         surface = self.surface.get()
         _, _, p = self.predictor.predict(a, b, surface, LEVELS[self.level.get()], ROUNDS[self.round.get()], day)
@@ -391,8 +430,14 @@ class App(tk.Tk):
         self.pct_a.configure(text=f'{p:.1%}'); self.pct_b.configure(text=f'{1 - p:.1%}')
         self._draw_bar()
         self._show_stats(a, b, surface, day)
-        self._show_bets(a, b, p, odds_a, odds_b)
-        self.message.configure(text='' if odds_a or odds_b else 'Add the odds you are offered to see each bet\'s chance and expected return.', fg=MUTED)
+        if self.picked and self.picked[1] is None:
+            self.picked[1] = {a, b}  # as resolved right after clicking the upcoming match
+        key = self.picked[0] if self.picked and self.picked[1] == {a, b} else None
+        stake = self._show_bets(a, b, p, odds_a, odds_b, bankroll, key)
+        if key and odds_a and odds_b:
+            self.verdicts[key] = stake
+            self._tag_upcoming()
+        self.message.configure(text='' if odds_a and odds_b else 'Add both players\' odds to get a bet or pass decision.', fg=MUTED)
         fair_a = (1 / odds_a) / (1 / odds_a + 1 / odds_b) if odds_a and odds_b else None
         level, headline, warnings = self.predictor.assess(a, b, p, fair_a, surface, day)
         bg, fg = BADGE[level]
@@ -424,6 +469,85 @@ class App(tk.Tk):
         self.slip_note.grid(row=4, column=0, sticky='w', pady=(10, 0))
         self._label(card, NOTE, 9, color=MUTED, wraplength=330, justify='left').grid(row=5, column=0, sticky='w', pady=(14, 0))
         self._refresh_slip()
+
+    def _upcoming_card(self, parent):
+        card = self._card(parent, 'Upcoming matches')
+        card.columnconfigure(0, weight=1)
+        top = tk.Frame(card, bg=CARD)
+        top.grid(row=1, column=0, sticky='ew')
+        self.upcoming_note = self._label(top, 'Loading...', 9, color=MUTED)
+        self.upcoming_note.pack(side='left')
+        self.upcoming_button = ttk.Button(top, text='Refresh', style='Slip.TButton', command=self._refresh_upcoming)
+        self.upcoming_button.pack(side='right')
+        frame = tk.Frame(card, bg=CARD)
+        frame.grid(row=2, column=0, sticky='ew', pady=(8, 0))
+        self.upcoming_list = ttk.Treeview(frame, columns=('when', 'event', 'match'), show='headings', height=6, selectmode='browse')
+        for col, title, width in (('when', 'When', 78), ('event', 'Event', 110), ('match', 'Match', 210)):
+            self.upcoming_list.heading(col, text=title, anchor='w')
+            self.upcoming_list.column(col, width=width, anchor='w', stretch=col == 'match')
+        bar = ttk.Scrollbar(frame, orient='vertical', command=self.upcoming_list.yview)
+        self.upcoming_list.configure(yscrollcommand=bar.set)
+        self.upcoming_list.pack(side='left', fill='x', expand=True)
+        bar.pack(side='left', fill='y')
+        self.upcoming_list.bind('<<TreeviewSelect>>', self._pick_upcoming)
+        self.upcoming_list.tag_configure('bet', background='#e3f4ea', foreground=GOOD)
+        self.upcoming_list.tag_configure('pass', foreground='#9aa1ab')
+        self.upcoming_rows = []
+
+    def _refresh_upcoming(self):
+        """Fetch the tour matches still to be played (Tennis Explorer, a few seconds) without blocking the app."""
+        self.upcoming_button.configure(state='disabled')
+        self.upcoming_note.configure(text='Loading...')
+        self.fetched = None
+        def work():
+            try:
+                self.fetched = tennis_explorer.upcoming(os.path.join(ROOT, 'data_set_2'))
+            except Exception as e:  # no internet, site changed...
+                self.fetched = e
+        threading.Thread(target=work, daemon=True).start()
+        self.after(300, self._show_upcoming)
+
+    def _show_upcoming(self):
+        if self.fetched is None:
+            return self.after(300, self._show_upcoming)
+        self.upcoming_button.configure(state='normal')
+        if isinstance(self.fetched, Exception):
+            return self.upcoming_note.configure(text=f'Could not load upcoming matches ({type(self.fetched).__name__})')
+        self.upcoming_rows = list(self.fetched.itertuples(index=False))
+        self.upcoming_list.delete(*self.upcoming_list.get_children())
+        today = pd.Timestamp.today().normalize()
+        for i, m in enumerate(self.upcoming_rows):
+            day = 'Today' if m.date == today else 'Tomorrow' if (m.date - today).days == 1 else m.date.strftime('%a %d')
+            surname = lambda name: name.split()[-1]
+            self.upcoming_list.insert('', 'end', iid=str(i), values=(f'{day} {m.time}', f'{m.event} {m.round}', f'{surname(m.player_a)} - {surname(m.player_b)}'))
+        self._tag_upcoming()
+        self.upcoming_note.configure(text=f'{len(self.upcoming_rows)} matches  -  click one, add the odds  -  green: bet  -  GMT+1'
+                                     if self.upcoming_rows else 'No tour matches scheduled in the next days')
+
+    def _tag_upcoming(self):
+        """Green: the risk manager suggests a bet; grey: checked with odds, pass."""
+        for i, m in enumerate(self.upcoming_rows):
+            stake = self.verdicts.get((m.date, m.player_a, m.player_b))
+            self.upcoming_list.item(str(i), tags=() if stake is None else ('bet',) if stake > 0 else ('pass',))
+
+    def _pick_upcoming(self, event=None):
+        """Fill the form with the selected match (odds left empty) and predict it."""
+        selected = self.upcoming_list.selection()
+        if not selected:
+            return
+        m = self.upcoming_rows[int(selected[0])]
+        self.picked = [(m.date, m.player_a, m.player_b), None]
+        self.a.set(m.player_a)
+        self.b.set(m.player_b)
+        self.surface.set(m.surface)
+        self._repaint_surface()
+        self.level.set(LEVEL_NAMES[m.level])
+        self.round.set(ROUND_NAMES.get(m.round, 'Round of 32'))
+        for entry, text in ((self.date, m.date.strftime('%Y-%m-%d')), (self.odds_a, ''), (self.odds_b, '')):
+            entry.delete(0, 'end')
+            entry.insert(0, text)
+        if self.predictor is not None:
+            self._predict()
 
     def _add_pick(self, i):
         c = self.current

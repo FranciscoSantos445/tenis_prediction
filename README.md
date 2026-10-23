@@ -7,16 +7,18 @@ chances with the bookmakers' odds. Includes a desktop app and a command-line too
 
 Test: July 2012 – October 2026, ~40,000 matches the model never saw (chronological 80/20 split).
 
-| | ROC AUC | Log loss | Accuracy |
-|---|---|---|---|
-| **Model** | **0.755** | **0.585** | **68.3%** |
-| Model before lower-level ratings | 0.741 | 0.597 | 67.2% |
-| Bookmakers (Bet365) | 0.758 | 0.582 | 68.7% |
+| Matches | | ROC AUC | Log loss | Accuracy |
+|---|---|---|---|---|
+| All ~40,000 | **Model** | **0.755** | **0.585** | **68.3%** |
+| All ~40,000 | Model before lower-level ratings | 0.741 | 0.597 | 67.2% |
+| 35,830 with Bet365 odds | Model | 0.745 | 0.593 | 67.6% |
+| 35,830 with Bet365 odds | Bookmaker (Bet365) | 0.758 | 0.582 | 67.5% |
 
 - **Probabilities are honest:** when the model says 70%, the player wins about 70% of the time.
-- **No betting edge:** the bookmakers are still more accurate.
-  - Betting whenever the model saw value lost 8–15% of the stakes.
-  - Even backing players that both the model and the bookmaker rated at 80% or more won 89.7% of bets but returned −2.8% at Bet365 (−0.1% at the best price available).
+- **No betting edge:** on the same matches the bookmaker is more accurate, at every tournament level and also for newcomers.
+  - Betting whenever the model saw value lost 10–17% of the stakes.
+  - The app's betting rule (below), starting with 1,000 (`--backtest 1000`): Bet365 235 bets, 991.93 at the end (−1.5% of
+    the stakes); Pinnacle 2,861 bets, 1,154.91 (+2.0%). Both are within chance of zero.
 - **Use it as a second opinion,** not a betting system.
 
 ## Setup
@@ -60,6 +62,7 @@ python3 predict_matches.py "Bublik" "Marozsan" --surface Hard --level A --round 
 python3 predict_matches.py --file ../predictions/matches.csv     # player_a, player_b, surface, tourney_level, round (+ odds_a, odds_b)
 python3 predict_matches.py --recent 20260921                      # predictions of matches since a date, model trained before it
 python3 predict_matches.py --check                                # rebuilt features match data_extraction
+python3 predict_matches.py --backtest 1000                        # the app's betting rule on 2012-2026, from 1000
 ```
 
 Levels: `G` Grand Slam, `M` Masters, `A` ATP 250/500, `F` Finals, `D` Davis Cup. Rounds: `R128`…`R16`, `QF`, `SF`, `F`, `RR`.
@@ -69,6 +72,15 @@ Levels: `G` Grand Slam, `M` Masters, `A` ATP 250/500, `F` Finals, `D` Davis Cup.
 - **Odds:** for each player, the model's and the bookmaker's chance and the expected return.
 - **Confidence badge:** green when both rate the same player 80%+, amber when they disagree on the favourite.
 - **Bet slip:** the chance that a combined bet wins.
+- **Upcoming matches:** tour matches of the next few days, from Tennis Explorer. Click one to fill the form; only the
+  odds are left to enter.
+- **Risk manager:** with both odds and your bankroll, BET or PASS for matches picked from Upcoming matches (green rows:
+  bet). Rules (`risk()` in `predict_matches.py`):
+  - **Chance:** 11% the model's, 89% the bookmaker's without its margin (the mix that fitted 2007–2012 best).
+  - **Bet only if** the expected return is positive and the odds are between 1.20 and 3.00.
+  - **Stake:** quarter-Kelly, at most 1% of the bankroll per bet and 3% per day. It also gives the lowest odds still
+    worth taking.
+  - **Expect PASS on almost every match:** in the backtest it bet on 235 of 35,830 matches.
 
 Players without tour-level matches are rated from their Challenger, qualifying and Futures results.
 
@@ -99,6 +111,8 @@ Players without tour-level matches are rated from their Challenger, qualifying a
   - **Symmetric predictions:** each prediction averages both player orders.
   - **Alternatives tested:** LightGBM, CatBoost, HistGradientBoosting, logistic regression and model averages were no
     better.
+  - **Betting rules tested:** a log-odds mix with the bookmaker and XGBoost with the odds as an input bet more often and
+    lost more than the 11% mix.
 
 ## Project structure
 
