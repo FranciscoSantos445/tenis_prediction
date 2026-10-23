@@ -1,13 +1,22 @@
 """Tennis match predictor - desktop app on top of predict_matches.py.
 
     python predict_app.py
+
+On the first start of the day it runs update.py in the background (new results, ratings, weekly model refit) and
+switches to the new data when that's done; the app can be used meanwhile with the previous day's data.
 """
+import os
+import subprocess
+import sys
 import threading
 import tkinter as tk
 from tkinter import ttk
 import numpy as np
 import pandas as pd
 from predict_matches import Predictor, SURFACES
+import update
+
+UPDATE_COMMAND = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'update.py')]
 
 BG, CARD, INK, MUTED, LINE = '#f2f4f7', '#ffffff', '#1d2433', '#6b7280', '#e3e6eb'
 NAVY, ACCENT, ACCENT_DARK = '#13213c', '#2f9e74', '#257f5d'
@@ -103,6 +112,7 @@ class App(tk.Tk):
         self.configure(bg=BG)
         self.minsize(1280, 600)
         self.predictor, self.names, self.p, self.current, self.slip = None, [], None, None, []
+        self.updater = None  # today's update.py run, if one was started
         self._style()
         self._header()
         body = tk.Frame(self, bg=BG)
@@ -317,11 +327,33 @@ class App(tk.Tk):
         pr = self.predictor
         # ranked players (as the ranking spells them, also those without matches) + players active since 2024 not in the ranking
         self.names = sorted(set(pr.alias) | ({p for p, last in pr.last.items() if last >= 20240101} - set(pr.alias.values())))
-        latest = pd.Timestamp(str(pr.latest)).strftime('%d %b %Y')
-        self.status.configure(text=f'Player data up to {latest}  -  {len(pr.last):,} players  -  final model')
         for box in (self.a, self.b):
             box.names, box.recent = self.names, {n: pr.last.get(pr.alias.get(n, n), 0) for n in self.names}
         self.button.configure(state='normal')
+        if self.updater is None and update.needed():
+            log = open(os.path.join(update.DATA, 'update.log'), 'w')
+            # own session: the update finishes even if the app is closed
+            self.updater = subprocess.Popen(UPDATE_COMMAND, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            self.after(5000, self._watch_update)
+        self._show_status()
+
+    def _show_status(self, note=''):
+        pr = self.predictor
+        latest = pd.Timestamp(str(pr.latest)).strftime('%d %b %Y')
+        if self.updater is not None and self.updater.poll() is None:
+            note = "updating today's data in the background..."
+        self.status.configure(text=f'Player data up to {latest}  -  {len(pr.last):,} players  -  final model' + (f'  -  {note}' if note else ''),
+                              fg='#ffb4a8' if 'failed' in note else '#aab4c8')
+
+    def _watch_update(self):
+        if self.updater.poll() is None:
+            return self.after(5000, self._watch_update)
+        if self.updater.returncode:
+            return self._show_status('update failed, see training_data_set/update.log')
+        self.button.configure(state='disabled')  # reload the updated data (a few seconds)
+        self.predictor = None
+        threading.Thread(target=self._load, daemon=True).start()
+        self.after(150, self._wait_until_loaded)
 
     @staticmethod
     def _odds(entry):

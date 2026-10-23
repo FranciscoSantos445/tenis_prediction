@@ -29,19 +29,28 @@ pip install pandas numpy requests tqdm matplotlib seaborn scikit-learn xgboost o
 
 - **App:** needs Tkinter (`sudo apt install python3-tk`).
 - **Training:** uses an NVIDIA GPU.
-- **Data:** not in the repo. Run steps 1–2 below once before predicting.
+- **Data:** not in the repo. Build it once with `python3 update.py` from `src/`, about 45 minutes. The first run
+  downloads everything, including Challenger results since June 2026.
 - **Notebooks:** run them from `src/`, which Jupyter and VS Code do by default.
 
-## Weekly update
+## Updates
 
-| Step | Notebook | Time | What it does |
-|---|---|---|---|
-| 1 | `atp-tennis-daily-pull.ipynb` | ~1 min (first run ~35 min) | Downloads results, odds, lower-level matches, new Challengers and the ATP ranking |
-| 2 | `data_extraction.ipynb` | ~15 min | Merges the sources, computes the ratings and features |
-| 3 | `data_training.ipynb` | seconds | Run the cells up to **Final model for real predictions** to refit the final model |
+**Automatic.** The first time the app opens each day, it runs `src/update.py` in the background, about 3 minutes:
 
-**Re-tuning** (every few months, or after changing features): delete `logloss_model.json`, `scaler.joblib`,
-`accuracy_model.json` and `accuracy_scaler.joblib` in `src/`, then run step 3 (about 10 minutes).
+| Step | What it does |
+|---|---|
+| `atp-tennis-daily-pull.ipynb` | Downloads the current season's results and odds, new Challengers and the ranking. Past seasons and the archive are cached |
+| `data_extraction.ipynb` | Rebuilds the player data and ratings, skipping the cells that only print or plot |
+| `data_training.ipynb`, final-model cell | Refits the model on every match, once every 7 days |
+
+- **While it runs:** the app works with the previous data and switches to the new data when the update finishes.
+- **Log:** `training_data_set/update.log`.
+- **By hand:** `python3 update.py`, or `python3 update.py --force` to run again on the same day.
+- **Tour results lag:** tennis-data publishes a tournament's results once it ends, so the current week's tour matches
+  arrive the following week.
+- **Re-tuning** (every few months, or after changing features): delete `logloss_model.json`, `scaler.joblib`,
+  `accuracy_model.json` and `accuracy_scaler.joblib` in `src/`, then run `data_training.ipynb` up to **Final model
+  for real predictions** (about 10 minutes).
 
 ## Predicting (from `src/`)
 
@@ -97,6 +106,7 @@ Players without tour-level matches are rated from their Challenger, qualifying a
 src/
   atp-tennis-daily-pull.ipynb, data_extraction.ipynb, data_training.ipynb   steps 1-3
   predict_matches.py, predict_app.py      command line and app
+  update.py                               daily update (run by the app)
   ratings.py                              Elo and Glicko-2
   tennis_explorer.py                      Challenger results since June 2026
   final_model.json, final_scaler.joblib   model used for predictions
