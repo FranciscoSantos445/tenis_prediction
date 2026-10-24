@@ -25,18 +25,22 @@ CATEGORICAL = ['tourney_level', 'surface', 'round']
 # p -> sigmoid(slope * logit(p)). The model before the lower-level ratings was slightly overconfident (slope 0.965); the
 # current one isn't: a slope fitted on its 2012-2018 test predictions did no better on 2019-2026 than leaving it at 1.
 CALIBRATION_SLOPE = 1.0
-GAVE_UP = re.compile(r'RET|W/O|Walkover')  # retired injured or gave a walkover
+# Best-of-5 (Grand Slams): the model is not confident enough in the favourite; slope fitted on 2007-2012, which on 2012-2026
+# Slam matches improved log loss 0.5085 -> 0.5079 (the same for best-of-3 made it worse)
+SLAM_SLOPE = 1.27
+GAVE_UP = re.compile(ratings.GAVE_UP)  # retired injured or gave a walkover
 # Risk manager (predict_app.py and --backtest). The model alone is less accurate than the bookmaker (2012-2026, same matches:
-# log loss 0.593 vs 0.582), so a bet is judged on a mix: MODEL_WEIGHT of the model's chance, the rest the bookmaker's (margin
+# log loss 0.592 vs 0.582), so a bet is judged on a mix: MODEL_WEIGHT of the model's chance, the rest the bookmaker's (margin
 # removed). The weight was fitted on 2007-2012 matches; on 2012-2026 the mix was no better than the bookmaker alone.
-MODEL_WEIGHT = 0.11
+MODEL_WEIGHT = 0.14
 MIN_ODDS, MAX_ODDS = 1.20, 3.00             # no bets below 1.20, nor on long shots above 3.00 (high variance)
 KELLY, MAX_BET, MAX_DAY = 0.25, 0.01, 0.03  # quarter-Kelly, at most 1% of the bankroll on one bet and 3% on one day
 
 
-def calibrate(p):
+def calibrate(p, best_of=3):
     p = np.clip(p, 1e-6, 1 - 1e-6)
-    return 1 / (1 + np.exp(-CALIBRATION_SLOPE * np.log(p / (1 - p))))
+    slope = np.where(np.asarray(best_of) == 5, SLAM_SLOPE, CALIBRATION_SLOPE)
+    return 1 / (1 + np.exp(-slope * np.log(p / (1 - p))))
 
 
 def _norm(s):
@@ -49,26 +53,38 @@ class Predictor:
         m = pd.read_csv(f'{ROOT}/training_data_set/dataset_more_metrics.csv',
                         usecols=['tourney_date', 'surface', 'tourney_level', 'Player_1', 'Player_2', 'score',
                                  'Player_1_performance', 'Player_2_performance'])
+        lower = ratings.load_lower(f'{ROOT}/data_set_2')
         if before:
-            m = m[m['tourney_date'] < before]
-            lower = ratings.load_lower(f'{ROOT}/data_set_2')
-            state = ratings.rate(m, lower[lower['tourney_date'] < before])[1]  # same code data_extraction uses
+            m, lower = m[m['tourney_date'] < before], lower[lower['tourney_date'] < before]
+            state = ratings.rate(m, lower)[1]  # same code data_extraction uses
         else:
             state = pd.read_csv(f'{ROOT}/training_data_set/player_ratings.csv', index_col='player')
         self.ratings = state.to_dict('index')  # Elo (overall + per surface) and Glicko-2 of every player, incl. lower levels
         self.latest = int(m['tourney_date'].max())
         self.matches, self.last, self.perf = defaultdict(int), {}, defaultdict(list)
         self.surface_record, self.h2h, self.gave_up = defaultdict(lambda: [0, 0]), defaultdict(int), {}
+        # for ratings.rest(): each player's tour and lower-level match days, whether he gave up his last tour match, the days
+        # he gave up a lower-level one
+        days = {d: ratings.day_number(d) for d in set(m['tourney_date']) | set(lower['tourney_date'])}
+        self.tour_days, self.tour_gave_up, self.lower_days, self.lower_gave_up = defaultdict(list), {}, defaultdict(list), defaultdict(set)
+        for w, l, d, g in zip(lower['winner_name'], lower['loser_name'], lower['tourney_date'], lower['score'].astype(str).str.contains(ratings.GAVE_UP)):
+            self.lower_days[w].append(days[d])
+            self.lower_days[l].append(days[d])
+            if g:
+                self.lower_gave_up[l].add(days[d])
         for r in m.itertuples(index=False):  # Player_1 is the winner
+            gave_up = bool(GAVE_UP.search(str(r.score)))
             for side, player, won in ((1, r.Player_1, 1), (2, r.Player_2, 0)):
                 self.matches[player] += 1
                 self.last[player] = r.tourney_date
+                self.tour_days[player].append(days[r.tourney_date])
+                self.tour_gave_up[player] = gave_up and not won
                 record = self.surface_record[(player, str(r.surface).strip())]
                 record[0] += won
                 record[1] += 1
                 self.perf[player].append(getattr(r, f'Player_{side}_performance'))
             self.h2h[(r.Player_1, r.Player_2)] += 1
-            if GAVE_UP.search(str(r.score)):
+            if gave_up:
                 self.gave_up[r.Player_2] = r.tourney_date
 
         players = pd.read_csv(f'{ROOT}/data_set_2/atp_players_till_2026.csv', usecols=['name_first', 'name_last', 'dob'])
@@ -129,6 +145,8 @@ class Predictor:
             glicko, rd = r['glicko'], ratings.inflate(r['glicko_phi'], r['glicko_sigma'], ratings.day_number(day) - r['glicko_day']) * ratings.Q
         else:  # never rated by Glicko-2 (new, or Futures only): starting values, as in data_extraction
             glicko, rd = start, ratings.PHI0 * ratings.Q
+        since, recent, injury = ratings.rest(self.tour_days.get(p, []), self.tour_gave_up.get(p, False), self.lower_days.get(p, []),
+                                             self.lower_gave_up.get(p, set()), ratings.day_number(day))
         day = pd.Timestamp(str(day))
         wins, n = self.surface_record.get((p, surface), (0, 0))
         perf = self.perf.get(p, [])[-5:]
@@ -139,7 +157,8 @@ class Predictor:
                 'glicko': glicko, 'rd': rd,
                 'surface_wins': wins, 'surface_matches': n,
                 'surface_win_rate': wins / n if n else np.nan,
-                'days_since_last': (day - pd.Timestamp(str(self.last[p]))).days if p in self.last else np.nan,
+                'days_since_last': since,  # every level
+                'matches_last_X_days': recent, 'injury_break': injury,
                 'recent_perf': np.mean(perf) if perf else np.nan,
                 'age': age if 14 <= age <= 50 else np.nan,
                 'career_matches': self.matches.get(p, 0),
@@ -149,8 +168,9 @@ class Predictor:
         pa, pb = self.profile(a, surface, day, tourney_level), self.profile(b, surface, day, tourney_level)
         wa, wb = self.h2h.get((a, b), 0), self.h2h.get((b, a), 0)
         row = {'elo_diff': pa['elo'] - pb['elo'], 'surface_elo_diff': pa['surface_elo'] - pb['surface_elo'],
-               'h2h_ratio': (wa + 1) / (wa + wb + 2), 'glicko_diff': pa['glicko'] - pb['glicko'], 'player1_rd': pa['rd'], 'player2_rd': pb['rd']}
-        for k in ('surface_win_rate', 'days_since_last', 'recent_perf', 'age', 'career_matches'):
+               'h2h_ratio': (wa + 1) / (wa + wb + 2), 'glicko_diff': pa['glicko'] - pb['glicko'], 'player1_rd': pa['rd'], 'player2_rd': pb['rd'],
+               'best_of': 5 if str(tourney_level).upper() == 'G' else 3}
+        for k in ('surface_win_rate', 'days_since_last', 'recent_perf', 'age', 'career_matches', 'matches_last_X_days', 'injury_break'):
             row[f'player1_{k}'], row[f'player2_{k}'] = pa[k], pb[k]
         for c, v in (('tourney_level', tourney_level), ('surface', surface), ('round', round_)):
             row[f'{c}_{v}'] = 1.0
@@ -164,7 +184,7 @@ class Predictor:
         a, b = self.resolve(a), self.resolve(b)
         day = day or pd.Timestamp.today().strftime('%Y%m%d')
         p = lambda x, y: self.model.predict_proba(self.scaler.transform(self.features(x, y, surface, tourney_level, round_, day)))[0, 1]
-        return a, b, float(calibrate((p(a, b) + 1 - p(b, a)) / 2))
+        return a, b, float(calibrate((p(a, b) + 1 - p(b, a)) / 2, 5 if str(tourney_level).upper() == 'G' else 3))
 
     def assess(self, a, b, p, fair_a=None, surface='Hard', day=None):
         """How much to trust a prediction: ('green' | 'neutral' | 'amber', headline, notes).
@@ -218,7 +238,7 @@ def recent(cutoff):
     """Train on matches before `cutoff` with the tuned settings, predict every match since (results unseen by the model)."""
     b = pd.read_csv(f'{ROOT}/training_data_set/tennis_matches_balanced.csv')
     info = pd.read_csv(f'{ROOT}/training_data_set/dataset_more_metrics.csv',
-                       usecols=['tourney_name', 'tourney_date', 'round', 'Player_1', 'Player_2', 'score', 'Odd_1', 'Odd_2', 'PS_1', 'PS_2'])
+                       usecols=['tourney_name', 'tourney_date', 'round', 'Player_1', 'Player_2', 'score', 'Odd_1', 'Odd_2', 'PS_1', 'PS_2', 'best_of'])
     columns = list(joblib.load(f'{SRC}/final_scaler.joblib').feature_names_in_)
     numeric = [c for c in columns if c in b.columns]
     X = pd.get_dummies(b[numeric + CATEGORICAL], columns=CATEGORICAL).reindex(columns=columns, fill_value=False)
@@ -230,7 +250,7 @@ def recent(cutoff):
     model = xgb.XGBClassifier(objective='binary:logistic', tree_method='hist', device='cuda', eval_metric='logloss',
                               n_estimators=tested.best_iteration + 1, **params).fit(scaler.transform(X[train]), b['outcome'][train])
     p = model.predict_proba(scaler.transform(X))[:, 1]
-    p_winner = calibrate((p[0::2] + 1 - p[1::2]) / 2)  # balanced rows come in (winner first, loser first) pairs
+    p_winner = calibrate((p[0::2] + 1 - p[1::2]) / 2, info['best_of'])  # balanced rows come in (winner first, loser first) pairs
     out = info.assign(p_winner=p_winner)[info['tourney_date'] >= cutoff]
     odds = out[['Odd_1', 'Odd_2']].apply(pd.to_numeric, errors='coerce').where(lambda o: o > 1)
     out = out.assign(bookmaker_p_winner=(1 / odds['Odd_1']) / (1 / odds['Odd_1'] + 1 / odds['Odd_2']))

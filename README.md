@@ -9,16 +9,18 @@ Test: July 2012 – October 2026, ~40,000 matches the model never saw (chronolog
 
 | Matches | | ROC AUC | Log loss | Accuracy |
 |---|---|---|---|---|
-| All ~40,000 | **Model** | **0.755** | **0.585** | **68.3%** |
+| All ~40,000 | **Model** | **0.756** | **0.583** | **68.5%** |
 | All ~40,000 | Model before lower-level ratings | 0.741 | 0.597 | 67.2% |
-| 35,830 with Bet365 odds | Model | 0.745 | 0.593 | 67.6% |
+| 35,830 with Bet365 odds | Model | 0.746 | 0.592 | 67.8% |
 | 35,830 with Bet365 odds | Bookmaker (Bet365) | 0.758 | 0.582 | 67.5% |
 
 - **Probabilities are honest:** when the model says 70%, the player wins about 70% of the time.
 - **No betting edge:** on the same matches the bookmaker is more accurate, at every tournament level and also for newcomers.
   - Betting whenever the model saw value lost 10–17% of the stakes.
-  - The app's betting rule (below), starting with 1,000 (`--backtest 1000`): Bet365 235 bets, 991.93 at the end (−1.5% of
-    the stakes); Pinnacle 2,861 bets, 1,154.91 (+2.0%). Both are within chance of zero.
+  - The app's betting rule (below), starting with 1,000 (`--backtest 1000`): Bet365 616 bets, 928.30 at the end (−4.3% of
+    the stakes); Pinnacle 4,568 bets, 1,397.99 (+1.9%). Both are within chance of zero.
+  - "Safe" bets (model 70%+, odds 1.20–5) lost 3.0% at Bet365; against newcomers they broke even (−0.5%), but lost
+    3–8% on 2007–2012. Players truly back from a break (60+ days at every level) are too rare to judge.
 - **Use it as a second opinion,** not a betting system.
 
 ## Setup
@@ -76,11 +78,11 @@ Levels: `G` Grand Slam, `M` Masters, `A` ATP 250/500, `F` Finals, `D` Davis Cup.
   odds are left to enter.
 - **Risk manager:** with both odds and your bankroll, BET or PASS for matches picked from Upcoming matches (green rows:
   bet). Rules (`risk()` in `predict_matches.py`):
-  - **Chance:** 11% the model's, 89% the bookmaker's without its margin (the mix that fitted 2007–2012 best).
+  - **Chance:** 14% the model's, 86% the bookmaker's without its margin (the mix that fitted 2007–2012 best).
   - **Bet only if** the expected return is positive and the odds are between 1.20 and 3.00.
   - **Stake:** quarter-Kelly, at most 1% of the bankroll per bet and 3% per day. It also gives the lowest odds still
     worth taking.
-  - **Expect PASS on almost every match:** in the backtest it bet on 235 of 35,830 matches.
+  - **Expect PASS on almost every match:** in the backtest it bet on 616 of 35,830 matches.
 
 Players without tour-level matches are rated from their Challenger, qualifying and Futures results.
 
@@ -100,19 +102,22 @@ Players without tour-level matches are rated from their Challenger, qualifying a
   - rating uncertainty;
   - head-to-head;
   - surface win rate;
-  - days since last match;
+  - rest, counting matches at every level (a player back through Challengers isn't on a break): days since the last
+    match, matches in the last 30 days, and the injury break (days out after retiring from a match or giving a walkover);
   - recent form;
   - age;
   - career matches;
-  - level, surface, round.
+  - level, surface, round, best of 3 or 5 sets.
 - **Model:**
   - **Tuning:** XGBoost tuned with Optuna on log loss.
   - **Final model:** `final_model.json` is retrained on every match; the app and command line use it.
   - **Symmetric predictions:** each prediction averages both player orders.
+  - **Grand Slams:** the model underrates favourites in best-of-5, so its chances there are stretched (`SLAM_SLOPE`).
   - **Alternatives tested:** LightGBM, CatBoost, HistGradientBoosting, logistic regression and model averages were no
     better.
   - **Betting rules tested:** a log-odds mix with the bookmaker and XGBoost with the odds as an input bet more often and
-    lost more than the 11% mix.
+    lost more than the mix.
+  - **Also no better:** lowering a player's Elo after a long absence, and blending the grass Elo with the overall one.
 
 ## Project structure
 

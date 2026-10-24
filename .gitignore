@@ -11,3 +11,5 @@ data_set_3/raw/
 training_data_set/last_update.txt
 training_data_set/update.log
 training_data_set/update.lock
+# Model files kept before a retrain
+training_data_set/model_backup*/

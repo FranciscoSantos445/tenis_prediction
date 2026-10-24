@@ -1,8 +1,8 @@
-max_depth: 5
-learning_rate: 0.020092949892158037
-subsample: 0.7576287444230166
-colsample_bytree: 0.7277515699221666
-gamma: 0.11898722326076679
-reg_alpha: 8.80130649834291
-reg_lambda: 4.823151100318746
-min_child_weight: 9
+max_depth: 7
+learning_rate: 0.027896576040309515
+subsample: 0.7827446303522669
+colsample_bytree: 0.6842338335630886
+gamma: 0.33201864314451274
+reg_alpha: 6.967255462719666
+reg_lambda: 5.930755770062452
+min_child_weight: 2

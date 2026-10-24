@@ -1,10 +1,12 @@
-"""Elo and Glicko-2 ratings, shared by data_extraction.ipynb (features for training) and predict_matches.py (today's ratings).
+"""Elo and Glicko-2 ratings, shared by data_extraction.ipynb (features for training) and predict_matches.py (today's ratings),
+and the rest features both compute the same way (rest()).
 
 Besides tour-level matches, the ratings also learn from lower levels, so a player arriving on tour already has a rating:
 Elo and Glicko-2 (rating + how uncertain it is) both learn from Challengers, tour qualifying and Futures.
 On 2012-2026 test matches this improved log loss 0.5968 -> 0.5849 (matches with a newcomer: 0.5879 -> 0.5611).
 """
 import math, re
+from bisect import bisect_left
 import numpy as np, pandas as pd
 
 SURFACES = ['Hard', 'Clay', 'Grass', 'Carpet']
@@ -17,6 +19,8 @@ GLICKO_LEVELS = {'qual_chall', 'futures'}             # lower levels Glicko-2 le
 Q, PHI0, SIGMA0, TAU = 173.7178, 350 / 173.7178, 0.06, 0.5  # Glicko-2 scale, starting deviation (RD 350), volatility, tau
 ROUND_ORDER = {'Q1': 0, 'Q2': 1, 'Q3': 2, 'Q4': 3, 'RR': 4, 'R128': 5, 'R64': 6, 'R32': 7, 'R16': 8, 'QF': 9, 'SF': 10, 'F': 11}
 ARCHIVE_END = 20260601  # Sackmann's Challenger files stop here; Tennis Explorer covers the Challengers from then on
+GAVE_UP = r'RET|W/O|Walkover'  # score of a match the loser retired from or gave a walkover in
+REST_DAYS = 30                 # window of rest()'s "matches in the last days"
 
 
 def load_lower(data_set_2):
@@ -75,6 +79,25 @@ def _glicko_update(mu, phi, sigma, mu_o, phi_o, score):
     sigma = math.exp(A / 2)
     phi = 1 / math.sqrt(1 / (phi * phi + sigma * sigma) + 1 / v)
     return mu + phi * phi * g * (score - e), phi, sigma
+
+
+def rest(tour_days, tour_gave_up, lower_days, lower_gave_up, day):
+    """A player's (days since his last match, matches in the last REST_DAYS days, injury break) before a match on `day`,
+    counting every level, so a player coming back through Challengers isn't on a break. Days are day_number()s.
+    - tour_days: his tour matches so far, sorted (earlier rounds of the same event included); tour_gave_up: he retired or
+      gave a walkover in the last of them;
+    - lower_days: his lower-level matches, sorted; only those before `day` count (their order within a day is unknown, as
+      in rate()); lower_gave_up: the days he gave one up;
+    - injury break: days since his last match if he gave that match up, else 0 (an injury layoff, not a rest)."""
+    j = bisect_left(lower_days, day)
+    last_tour, last_lower = (tour_days[-1] if tour_days else None), (lower_days[j - 1] if j else None)
+    if last_tour is None and last_lower is None:
+        return np.nan, 0, 0
+    tour_latest = last_lower is None or (last_tour is not None and last_tour >= last_lower)
+    since = day - (last_tour if tour_latest else last_lower)
+    gave_up = tour_gave_up if tour_latest else last_lower in lower_gave_up
+    recent = len(tour_days) - bisect_left(tour_days, day - REST_DAYS) + j - bisect_left(lower_days, day - REST_DAYS)
+    return since, recent, since if gave_up else 0
 
 
 def rate(tour, lower):
@@ -136,7 +159,11 @@ def rate(tour, lower):
     return pd.DataFrame(out, index=tour.index), state
 
 
-if __name__ == '__main__':  # self-check of the Glicko-2 update on Glickman's worked example (rating 1500, RD 200 vs 1400 / RD 30, a win)
+if __name__ == '__main__':  # self-checks: Glicko-2 on Glickman's worked example (rating 1500, RD 200 vs 1400 / RD 30, a win), rest()
     mu, phi, sigma = _glicko_update(0, 200 / Q, 0.06, (1400 - 1500) / Q, 30 / Q, 1.0)
     assert abs(mu * Q + 1500 - 1563.6) < 0.1 and abs(phi * Q - 175.4) < 0.1, (mu * Q + 1500, phi * Q)
+    # rest(): tour matches 40 and 10 days ago (gave the last one up), a Challenger 5 days ago and one today (not counted yet)
+    assert rest([60, 90], True, [95, 100], set(), 100) == (5, 2, 0)
+    assert rest([60, 90], True, [], set(), 100) == (10, 1, 10)
+    assert rest([], False, [95], {95}, 100) == (5, 1, 5) and np.isnan(rest([], False, [], set(), 100)[0])
     print('ok')
